@@ -4,6 +4,7 @@ from __future__ import print_function
 from __future__ import unicode_literals
 
 from onnx import numpy_helper, ValueInfoProto, AttributeProto, GraphProto, NodeProto, TensorProto, TensorShapeProto
+import onnx
 from typing import Any, Text, Iterable, List, Dict, Sequence, Optional, Tuple, Union
 from typing_extensions import Protocol
 import numpy as np
@@ -169,10 +170,12 @@ class Graph(object):
         input_tensors = {
             t.name: numpy_helper.to_array(t) for t in graph.initializer
         }
+        print("=======weights tensors name:",input_tensors.keys())
         nodes_ = []
         nodes_by_input = {}  # type: Dict[Text, List[Node]]
         nodes_by_output = {}
         for node in graph.node:
+            #print("============", onnx.helper.printable_node(node))
             node_ = Node.from_onnx(node)
             for input_ in node_.inputs:
                 if input_ in input_tensors:

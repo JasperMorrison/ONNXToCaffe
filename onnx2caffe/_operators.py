@@ -29,9 +29,12 @@ def make_input(input,version):
     shape = list(shape)
     input_layer = myf("Input", name, [], output, input_param=dict(shape=dict(dim=shape)))
     if version != opset_version:
+        '''lcr
         raise TypeError(
             "ONNX opset version {} is not supported,only opset 9 is supported,you can export onnx by setting opset_version like torch.onnx.export(model, '', opset_version=9, verbose=True).\n".format(version )
         )
+        '''
+        print("WARNING: ONNX opset version {} is not supported,only opset 9 is supported,you can export onnx by setting opset_version like torch.onnx.export(model, '', opset_version=9, verbose=True).\n".format(version ))
     return input_layer
 
 def _convert_conv(node, graph, err):
@@ -173,6 +176,9 @@ def _convert_Add(node,graph,err):
 
     max_dim = 0
     for name in input_name_list:
+        # lcr, there is some Add node with one input is 0
+        if name not in graph.channel_dims:
+            continue
         if graph.channel_dims[name]>max_dim:
             max_dim = graph.channel_dims[name]
 
@@ -191,6 +197,56 @@ def _convert_Add(node,graph,err):
     layer = myf("Eltwise",node_name,input_name_list,[output_name],operation=P.Eltwise.SUM)
     graph.channel_dims[output_name] = graph.channel_dims[input_name_list[0]]
     return layer
+
+def _convert_Sub(node,graph,err):
+    input_name_list = [str(i) for i in node.inputs]
+    output_name = str(node.outputs[0])
+    node_name = node.name
+
+    max_dim = 0
+    for name in input_name_list:
+        # lcr, there is some Add node with one input is 0
+        if name not in graph.channel_dims:
+            continue
+        if graph.channel_dims[name]>max_dim:
+            max_dim = graph.channel_dims[name]
+
+    if 'broadcast' in node.attrs:
+        if node.attrs['broadcast'] == 1:
+            input_node_number = len(input_name_list)
+            if input_node_number !=2:
+                return err.unsupported_op_configuration(node, "Broadcast Add must has 2 input, not {}".format(input_node_number))
+            axis = node.attrs['axis']
+            flat_layer = myf("Flatten",node_name+'_flat',[input_name_list[1]],[output_name+'_flat'])
+            layer = myf("Bias", node_name, [input_name_list[0],output_name+'_flat'], [output_name], axis = axis)
+            # layer = myf("Bias", node_name, input_name_list, [output_name], bias_term = False, axis = axis)
+            graph.channel_dims[output_name] = graph.channel_dims[input_name_list[0]]
+            return flat_layer,layer
+
+    layer = myf("Eltwise",node_name,input_name_list,[output_name],operation=P.Eltwise.SUM,coeff=[1,-1])
+    graph.channel_dims[output_name] = graph.channel_dims[input_name_list[0]]
+    return layer
+
+# eltwise(pow(X,-1),Y)
+def _convert_Div(node,graph,err):
+    print("TODO", node.attrs)
+    input_name = str(node.inputs[0])
+    input_name_y = str(node.inputs[1])
+    output_name = str(node.outputs[0])
+    name = str(node.name)
+
+    if input_name==output_name:
+        inplace = True
+    else:
+        inplace = False
+
+    layer = myf("Power",name+"div",[input_name],[output_name+"_div"],in_place=inplace, power=-1)
+    eltwise_layer = myf("Eltwise",name,[input_name_y, output_name+"_div"],[output_name],operation=P.Eltwise.PROD)
+    # l_top_relu1 = L.ReLU(l_bottom, name=name, in_place=True)
+
+    graph.channel_dims[output_name] = graph.channel_dims[input_name]
+
+    return layer,eltwise_layer
 
 def _convert_Mul(node,graph,err):
     input_name_list = [str(i) for i in node.inputs]
@@ -221,8 +277,34 @@ def _convert_Mul(node,graph,err):
     graph.channel_dims[output_name] = graph.channel_dims[input_name_list[0]]
     return layer
 
+def _convert_Exp(node,graph,err):
+    input_name = str(node.inputs[0])
+    output_name = str(node.outputs[0])
+    name = str(node.name)
+    print("TODO",node.attrs)
+
+    if input_name==output_name:
+        inplace = True
+    else:
+        inplace = False
+
+    layer = myf("Exp",name,[input_name],[output_name],in_place=inplace)
+    # l_top_relu1 = L.ReLU(l_bottom, name=name, in_place=True)
+
+    graph.channel_dims[output_name] = graph.channel_dims[input_name]
+
+    return layer
+
 def _convert_Unsqueeze(node,graph,err):
-    return err.unsupported_op_configuration(node, "Unsupport Unsqueeze in caffe")
+    #return err.unsupported_op_configuration(node, "Unsupport Unsqueeze in caffe")
+    print("TODO", node.attrs)
+    node_name = node.name
+    input_name = str(node.inputs[0])
+    output_name = str(node.outputs[0])
+    input_shape = graph.shape_dict[node.inputs[0]]
+    shape=[1] + list(input_shape)
+    layer = myf("Reshape", node_name, [input_name], [output_name], reshape_param = dict(shape=dict(dim=shape)))
+    return layer
 
 def _convert_Squeeze(node,graph,err):
     return err.unsupported_op_configuration(node, "Unsupport Squeeze in caffe")
@@ -355,8 +437,86 @@ def _convert_gemm(node,graph,err):
 
     return layer
 
+def _convert_resize(node,graph,err):
+    # factor_list = node.input_tensors.get(node.inputs[1])
+    node_name = node.name
+    input_name = str(node.inputs[0])
+    output_name = str(node.outputs[0])
+    mode = node.attrs["mode"]
+    # lcr add
+    scales = node.input_tensors.get(node.inputs[0])
+    size = graph.shape_dict[node.inputs[0]]
+    scales = int(graph.shape_dict[node.outputs[0]][2]/size[2])
+    scales = [scales] * 4
+    #https://github.com/pytorch/pytorch/issues/6900
+    if  str(mode,encoding="gbk") == "linear": #mode=="linear":
+        # factor = int(node.attrs["scales"])
+        # input_shape = graph.shape_dict[input_name]
+        # channels = input_shape[1]
+        channels = graph.channel_dims[input_name]
+        # pad = int(math.ceil((factor - 1) / 2.))
+        # layer = myf("Deconvolution", node_name, [input_name], [output_name],
+        #             kernel_size=2 * factor - factor % 2,
+        #             stride=factor, group=channels,
+        #             pad = pad, num_output=channels, bias_term = False)
+        #scales = node.input_tensors.get(node.inputs[1])
+        height_scale = int(scales[2])
+        width_scale = int(scales[3])
+        pad_h = int(math.ceil((height_scale - 1) / 2.))
+        pad_w = int(math.ceil((width_scale - 1) / 2.))
+        layer = myf("Deconvolution", node_name, [input_name], [output_name],
+                    convolution_param=dict(
+                        num_output=channels,
+                        # kernel_size=(int(2 * height_scale - height_scale % 2),int(2 * width_scale - width_scale % 2)),
+                        # stride=(height_scale,width_scale),
+                        # pad=(pad_h,pad_w),
+                        kernel_h=int(2 * height_scale - height_scale % 2),
+                        kernel_w=int(2 * width_scale - width_scale % 2),
+                        stride_h=height_scale,
+                        stride_w=height_scale,
+                        pad_h=pad_h,
+                        pad_w=pad_w,
+                        group=channels,
+                        bias_term=False,
+                        weight_filler=dict(type="bilinear")
+                    ),param=dict(lr_mult=0,decay_mult=0))
+    # https://github.com/jnulzl/caffe_plus 里面的upsample 是用的nearest插值
+    elif str(mode,encoding="gbk") == "nearest":
+        #scales = node.input_tensors.get(node.inputs[1])
+        height_scale = scales[2]
+        width_scale = scales[3]
+        layer = myf("Upsample", node_name, [input_name], [output_name],
+                    upsample_param=dict(
+                        mode = int(0),
+                        height_scale = int(height_scale),
+                        width_scale = int(width_scale)
+                    ))
+    else:
+        #scales = node.input_tensors.get(node.inputs[1])
+        height_scale = int(scales[2])
+        width_scale = int(scales[3])
+        # factor = int(node.attrs["scales"])
+        # input_shape = graph.shape_dict[input_name]
+        # channels = input_shape[1]
+        channels = graph.channel_dims[input_name]
+        print(height_scale)
+        print(width_scale)
 
+        layer = myf("Deconvolution", node_name, [input_name], [output_name],
+                    convolution_param=dict(
+                        num_output=channels,
+                        # kernel_size=(height_scale,width_scale),
+                        # stride=(height_scale,width_scale),
+                        kernel_h=height_scale,
+                        kernel_w=width_scale,
+                        stride_h=height_scale,
+                        stride_w=height_scale,
+                        group=channels,
+                        bias_term=False,
+                    ))
 
+    graph.channel_dims[output_name] = graph.channel_dims[input_name]
+    return layer
 
 def _convert_upsample(node,graph,err):
     # factor_list = node.input_tensors.get(node.inputs[1])
@@ -550,8 +710,25 @@ def _convert_reduce_mean(node,graph,err):
                                                                                     global_pooling=True)
     elif len(axes) == 3:
         layer = myf("Reduction", node_name, [input_name], [output_name], reduction_param = dict(axis=1, operation=P.Reduction.MEAN))
+    elif len(axes) == 1:
+        layer = myf("Reduction", node_name, [input_name], [output_name], reduction_param = dict(axis=axes[0], operation=P.Reduction.MEAN))
     else:
         return err.unsupported_op_configuration(node, "Unsupported reduce mean type")
+
+    graph.channel_dims[output_name] = graph.channel_dims[input_name]
+    return layer
+
+def _convert_reduce_sum(node,graph,err):
+    node_name = node.name
+    input_name = str(node.inputs[0])
+    output_name = str(node.outputs[0])
+    axes = node.attrs['axes']
+    keep_dim = node.attrs.get("keepdims", 0)
+
+    if len(axes) == 1:
+        layer = myf("Reduction", node_name, [input_name], [output_name], reduction_param = dict(axis=axes[0], operation=P.Reduction.SUM))
+    else:
+        return err.unsupported_op_configuration(node, "Unsupported reduce sum type")
 
     graph.channel_dims[output_name] = graph.channel_dims[input_name]
     return layer
@@ -657,6 +834,18 @@ def _convert_conv_slice(node, graph, err):
     graph.channel_dims[output_name_list[-1]] = channels - valid_pts[-1]
     return layer
 
+def _convert_reducemax(node, graph, err):
+    print("TODO", node.attrs)
+    return _convert_reduce_mean(node, graph, err)
+
+def _convert_ArgMax(node, graph, err):
+    print("TODO", node.attrs)
+    input_name = str(node.inputs[0])
+    output_name = str(node.outputs[0])
+    node_name = node.name
+    layer = myf('ArgMax', node_name, [input_name], [output_name])
+    graph.channel_dims[output_name] = graph.channel_dims[input_name]
+    return layer
 
 _ONNX_NODE_REGISTRY = {
     "Conv": _convert_conv,
@@ -665,10 +854,18 @@ _ONNX_NODE_REGISTRY = {
     "PRelu": _convert_prelu,
     "Transpose": _convert_permute,
     "ReduceMean": _convert_reduce_mean,
+    # not test
+    "ReduceSum": _convert_reduce_sum,
     "MatMul": _convert_matmul,
     "BatchNormalization": _convert_BatchNorm,
     "Add": _convert_Add,
+    # not test
+    "Sub": _convert_Sub,
     "Mul": _convert_Mul,
+    # not test
+    "Div": _convert_Div,
+    # not test
+    "Exp": _convert_Exp,
     "Reshape": _convert_Reshape,
     "MaxPool": _convert_pool,
     "AveragePool": _convert_pool,
@@ -685,5 +882,10 @@ _ONNX_NODE_REGISTRY = {
     "Unsqueeze":_convert_Unsqueeze,
     "Squeeze":_convert_Squeeze,
     "Slice": _convert_conv_slice,
-    # "Resize": _convert_upsample, # yolov5s的resize等同于 upsample
+    # not test
+    "Resize": _convert_resize, # yolov5s, HRNet的resize等同于 upsample
+    # not test
+    "ReduceMax": _convert_reducemax, # HRNet
+    # not test
+    "ArgMax": _convert_ArgMax
 }
